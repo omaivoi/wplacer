@@ -315,3 +315,4 @@ export class WPlacer {
         return new Promise((resolve) => setTimeout(resolve, ms));
     };
 };
+export { pallete };

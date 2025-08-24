@@ -2,6 +2,9 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { WPlacer, log, duration } from "./wplacer.js";
 import express from "express";
 import cors from "cors";
+import { pallete } from "./wplacer.js"; // 需要导出 pallete，方便解析颜色
+
+const pixelTasks = []; // 全局任务队列（优先级最高）
 
 // User data handling
 const users = existsSync("users.json") ? JSON.parse(readFileSync("users.json", "utf8")) : {};
@@ -146,6 +149,88 @@ function logUserError(error, id, name, context) {
     }
 }
 
+// API像素绘画任务管理器
+class PixelTaskManager {
+    constructor() {
+        this.running = false;
+    }
+
+    async start() {
+        if (this.running) return;
+        this.running = true;
+
+        log("SYSTEM", "pixelTask", "▶️ PixelTaskManager started.");
+
+        while (this.running) {
+            if (pixelTasks.length === 0) {
+                // 没任务 → 休眠 2 秒再检查
+                await new Promise(r => setTimeout(r, 2000));
+                continue;
+            }
+
+            const task = pixelTasks.shift();
+            log("SYSTEM", "pixelTask", `🖌️ Processing task ${task.taskid} (${task.taskname}) ...`);
+
+            // 选一个可用用户执行（比如第一个用户）
+            const userIds = Object.keys(users);
+            if (userIds.length === 0) {
+                log("SYSTEM", "pixelTask", "⚠️ No users available to paint pixels.");
+                continue;
+            }
+
+            const userId = userIds[0]; // 简单起见，选第一个账号
+            if (activeBrowserUsers.has(userId)) {
+                pixelTasks.unshift(task); // 账号忙，把任务放回队列
+                await new Promise(r => setTimeout(r, 2000));
+                continue;
+            }
+
+            activeBrowserUsers.add(userId);
+            const wplacer = new WPlacer(null, null, null, currentSettings, "pixelTask");
+
+            try {
+                await wplacer.login(users[userId].cookies);
+                const token = await TokenManager.getToken();
+                wplacer.token = token;
+
+                // 按 tile 分组
+                const bodiesByTile = task.mark.reduce((acc, p) => {
+                    const key = `${p.TlX},${p.TlY}`;
+                    if (!acc[key]) acc[key] = { colors: [], coords: [] };
+
+                    const colorId = pallete[p.color];
+                    if (!colorId) {
+                        console.warn(`[pixelTask] ⚠️ Unknown color ${p.color}, skipping`);
+                        return acc;
+                    }
+
+                    acc[key].colors.push(colorId);
+                    acc[key].coords.push(p.PxX, p.PxY);
+                    return acc;
+                }, {});
+
+                for (const tileKey in bodiesByTile) {
+                    const [tx, ty] = tileKey.split(",").map(Number);
+                    const body = { ...bodiesByTile[tileKey], t: wplacer.token };
+                    await wplacer._executePaint(tx, ty, body);
+                }
+
+                log("SYSTEM", "pixelTask", `[${task.taskname}] ✅ Finished task ${task.taskid}`);
+            } catch (err) {
+                log("SYSTEM", "pixelTask", `[${task.taskname}] ❌ Failed task ${task.taskid}`, err);
+            } finally {
+                await wplacer.close();
+                activeBrowserUsers.delete(userId);
+            }
+        }
+    }
+
+    stop() {
+        this.running = false;
+    }
+}
+
+
 class TemplateManager {
     constructor(name, templateData, coords, canBuyCharges, canBuyMaxCharges, antiGriefMode, userIds) {
         this.name = name;
@@ -241,6 +326,43 @@ class TemplateManager {
     }
 
     async _performPaintTurn(wplacer) {
+        // --- 优先执行 pixelTasks ---
+        if (pixelTasks.length > 0) {
+            const task = pixelTasks.shift();
+            try {
+                const token = await TokenManager.getToken();
+                wplacer.token = token;
+
+                // 按 tile 分组
+                const bodiesByTile = task.mark.reduce((acc, p) => {
+                    const key = `${p.TlX},${p.TlY}`;
+                    if (!acc[key]) acc[key] = { colors: [], coords: [] };
+
+                    // 颜色转 palette ID
+                    const colorId = pallete[p.color];
+                    if (!colorId) {
+                        console.warn(`[pixelTask] ⚠️ Unknown color ${p.color}, skipping`);
+                        return acc;
+                    }
+
+                    acc[key].colors.push(colorId);
+                    acc[key].coords.push(p.PxX, p.PxY);
+                    return acc;
+                }, {});
+
+                for (const tileKey in bodiesByTile) {
+                    const [tx, ty] = tileKey.split(",").map(Number);
+                    const body = { ...bodiesByTile[tileKey], t: wplacer.token };
+                    await wplacer._executePaint(tx, ty, body);
+                }
+
+                log("SYSTEM", "pixelTask", `[${task.taskname}] ✅ Executed pixel task ${task.taskid}`);
+            } catch (err) {
+                log("SYSTEM", "pixelTask", `[${task.taskname}] ❌ Failed pixel task ${task.taskid}`, err);
+            }
+            return; // 不继续模板绘制
+        }
+        // 原来的绘制逻辑
         let paintingComplete = false;
         while (!paintingComplete && this.running) {
             try {
@@ -660,6 +782,29 @@ app.post("/t", async (req, res) => {
     res.sendStatus(200);
 });
 
+// API endpoint for pixel tasks
+app.post("/pixelTask", async (req, res) => {
+    console.log(req.body);
+    const { taskname, mark } = req.body;
+    if (!taskname || !Array.isArray(mark)) {
+        return res.status(400).json({ error: "Invalid payload" });
+    }
+
+    const taskid = crypto.randomUUID();
+
+    // 转换任务，存入队列
+    pixelTasks.push({
+        taskid,
+        taskname,
+        mark
+    });
+
+    res.json({
+        taskname,
+        taskid,
+        status: "queued"
+    });
+});
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 // --- New Keep-Alive System ---
@@ -728,5 +873,8 @@ const diffVer = (v1, v2) => v1.split(".").map(Number).reduce((r, n, i) => r || (
         console.log(`✅ Open http://${host}${port !== 80 ? `:${port}` : ""}/ in your browser to start!`);
         TokenManager.getToken().catch(() => {}); // Initial token request
         setInterval(keepAlive, 20 * 60 * 1000);
+        // API 像素绘画任务
+        const pixelTaskManager = new PixelTaskManager();
+        pixelTaskManager.start().catch(err => log("SYSTEM", "pixelTask", "PixelTaskManager encountered an error", err));
     });
 })();
