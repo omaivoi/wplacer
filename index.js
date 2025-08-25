@@ -170,58 +170,18 @@ class PixelTaskManager {
 
             const task = pixelTasks.shift();
             log("SYSTEM", "pixelTask", `🖌️ Processing task ${task.taskid} (${task.taskname}) ...`);
+            
+            await assignBatch(task);
+            log("SYSTEM", "pixelTask", `[${task.taskname}] 🎉 Task finished.`);
+            // // 🔥 在这里逐像素执行 assignPixel
+            // for (const pixel of task.mark) { 
+            //     const success = await assignPixel(pixel, task);
+            //     if (!success) {
+            //         log("SYSTEM", "pixelTask", `[${task.taskname}] ⚠️ Pixel (${pixel.PxX},${pixel.PxY},${pixel.color}) could not be painted (no suitable account).`);
+            //     }
+            // }
 
-            // 选一个可用用户执行（比如第一个用户）
-            const userIds = Object.keys(users);
-            if (userIds.length === 0) {
-                log("SYSTEM", "pixelTask", "⚠️ No users available to paint pixels.");
-                continue;
-            }
-
-            const userId = userIds[0]; // 简单起见，选第一个账号
-            if (activeBrowserUsers.has(userId)) {
-                pixelTasks.unshift(task); // 账号忙，把任务放回队列
-                await new Promise(r => setTimeout(r, 2000));
-                continue;
-            }
-
-            activeBrowserUsers.add(userId);
-            const wplacer = new WPlacer(null, null, null, currentSettings, "pixelTask");
-
-            try {
-                await wplacer.login(users[userId].cookies);
-                const token = await TokenManager.getToken();
-                wplacer.token = token;
-
-                // 按 tile 分组
-                const bodiesByTile = task.mark.reduce((acc, p) => {
-                    const key = `${p.TlX},${p.TlY}`;
-                    if (!acc[key]) acc[key] = { colors: [], coords: [] };
-
-                    const colorId = pallete[p.color];
-                    if (!colorId) {
-                        console.warn(`[pixelTask] ⚠️ Unknown color ${p.color}, skipping`);
-                        return acc;
-                    }
-
-                    acc[key].colors.push(colorId);
-                    acc[key].coords.push(p.PxX, p.PxY);
-                    return acc;
-                }, {});
-
-                for (const tileKey in bodiesByTile) {
-                    const [tx, ty] = tileKey.split(",").map(Number);
-                    const body = { ...bodiesByTile[tileKey], t: wplacer.token };
-                    await wplacer._executePaint(tx, ty, body);
-                }
-
-                log("SYSTEM", "pixelTask", `[${task.taskname}] ✅ Finished task ${task.taskid}`);
-            } catch (err) {
-                log("SYSTEM", "pixelTask", `[${task.taskname}] ❌ Failed task ${task.taskid}`, err);
-            } finally {
-                await wplacer.close();
-                activeBrowserUsers.delete(userId);
-            }
+            // log("SYSTEM", "pixelTask", `[${task.taskname}] ✅ Finished task ${task.taskid}`);
         }
     }
 
@@ -229,6 +189,151 @@ class PixelTaskManager {
         this.running = false;
     }
 }
+
+// 账号画图
+async function assignBatch(task) {
+    // 还没完成的像素池
+    let remaining = [...task.mark];
+let lastRemaining = -1;
+
+while (remaining.length > 0 && remaining.length !== lastRemaining) {
+    lastRemaining = remaining.length;
+
+    for (const userId of Object.keys(users)) {
+        if (remaining.length === 0) break; // 全部完成了
+
+        if (activeBrowserUsers.has(userId)) continue;
+
+        const wplacer = new WPlacer(null, null, null, currentSettings, "pixelTask");
+        try {
+            await wplacer.login(users[userId].cookies);
+            const token = await TokenManager.getToken();
+            wplacer.token = token;
+
+            const charges = wplacer.userInfo.charges.count;
+            if (charges <= 0) {
+                log("SYSTEM", "pixelTask", `${wplacer.userInfo.name} 没有颜料`);
+                continue;
+            }
+
+            // 账号拥有的颜色集合
+            const availableColors = Object.keys(pallete).filter(c => wplacer.hasColor(pallete[c]));
+
+            // 筛选出该账号能画的像素
+            const doable = remaining.filter(p => availableColors.includes(p.color));
+
+            if (doable.length === 0) continue;
+
+            // 按 charges 限制数量
+            const batch = doable.slice(0, charges);
+
+            // 按 tile 分组
+            const bodiesByTile = batch.reduce((acc, p) => {
+                const key = `${p.TlX},${p.TlY}`;
+                if (!acc[key]) acc[key] = { colors: [], coords: [] };
+
+                acc[key].colors.push(pallete[p.color]);
+                acc[key].coords.push(p.PxX, p.PxY);
+                return acc;
+            }, {});
+
+            // 执行绘制
+            for (const tileKey in bodiesByTile) {
+            const [tx, ty] = tileKey.split(",").map(Number);
+            let body = { ...bodiesByTile[tileKey], t: wplacer.token };
+
+            let success = false;
+            let attempts = 0;
+            let maxAttempts = 100;
+
+            while (!success && attempts < maxAttempts) {   // 最多尝试 100 次
+                try {
+                    const result = await wplacer._executePaint(tx, ty, body);
+                    log("SYSTEM", "pixelTask", `${wplacer.userInfo.name} ✅ painted ${result.painted} pixels in tile (${tx},${ty})`);
+                    success = true;
+                } catch (err) {
+                    if (String(err).includes("REFRESH_TOKEN")) {
+                        log("SYSTEM", "pixelTask", `${wplacer.userInfo.name} 🔄 Token expired, refreshing...`);
+                        TokenManager.invalidateToken(); // 强制让下次 getToken() 拿新 token
+                        await wplacer.login(users[userId].cookies);
+                        wplacer.token = await TokenManager.getToken();
+                        body = { ...bodiesByTile[tileKey], t: wplacer.token };
+                        attempts++;
+                        continue; // 再试
+                    } else {
+                        console.error(`[pixelTask] ❌ User ${userId} failed`, err);
+                        break; // 不是 token 问题就直接退出
+                    }
+                }
+            }
+        }
+
+            // 从 remaining 里去掉已画的
+            const paintedSet = new Set(batch.map(p => `${p.TlX},${p.TlY},${p.PxX},${p.PxY},${p.color}`));
+            remaining = remaining.filter(p => !paintedSet.has(`${p.TlX},${p.TlY},${p.PxX},${p.PxY},${p.color}`));
+
+        } catch (err) {
+            console.error(`[pixelTask] ❌ User ${userId} failed`, err);
+        } finally {
+            await wplacer.close();
+            activeBrowserUsers.delete(userId);
+        }
+    }
+}
+    if (remaining.length > 0) {
+        log("SYSTEM", "pixelTask", `[${task.taskname}] ⚠️ 还有 ${remaining.length} 个像素未能完成`);
+    } else {
+        log("SYSTEM", "pixelTask", `[${task.taskname}] ✅ 全部完成`);
+    }
+}
+
+async function assignPixel(pixel, task) {
+    const colorId = pallete[pixel.color];
+    if (!colorId) {
+        console.warn(`[pixelTask] ⚠️ Unknown color ${pixel.color}, skipping`);
+        return false;
+    }
+
+    for (const userId of Object.keys(users)) {
+        if (activeBrowserUsers.has(userId)) continue;
+
+        const wplacer = new WPlacer(null, null, null, currentSettings, "pixelTask");
+        try {
+            await wplacer.login(users[userId].cookies);
+            const token = await TokenManager.getToken();
+            wplacer.token = token;
+
+            // 检查是否有 charges
+            if (wplacer.userInfo.charges.count <= 0) {
+                log("SYSTEM", "pixelTask", `[${task.taskname}] ${wplacer.userInfo.name} 没有颜料`);
+                continue;
+            }
+
+            // 检查是否有颜色权限
+            if (!wplacer.hasColor(colorId)) {
+                log("SYSTEM", "pixelTask", `[${task.taskname}] ${wplacer.userInfo.name} 没有颜色 ${pixel.color}`);
+                continue;
+            }
+
+            // 执行绘制
+            const body = { colors: [colorId], coords: [pixel.PxX, pixel.PxY], t: wplacer.token };
+            const result = await wplacer._executePaint(pixel.TlX, pixel.TlY, body);
+
+            if (result.painted > 0) {
+                log("SYSTEM", "pixelTask", `[${task.taskname}] ✅ Pixel (${pixel.PxX},${pixel.PxY},${pixel.color}) by ${wplacer.userInfo.name}`);
+                return true;
+            }
+        } catch (err) {
+            console.error(`[pixelTask] ❌ User ${userId} failed to paint pixel (${pixel.PxX},${pixel.PxY})`, err);
+        } finally {
+            await wplacer.close();
+            activeBrowserUsers.delete(userId);
+        }
+    }
+
+    return false; // 没有账号能完成
+}
+
 
 
 class TemplateManager {
